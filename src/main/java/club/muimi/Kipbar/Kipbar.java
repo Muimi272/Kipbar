@@ -1,94 +1,269 @@
 package club.muimi.Kipbar;
 
-import java.util.concurrent.BlockingDeque;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
+import java.io.Closeable;
+import java.io.PrintStream;
+import java.time.Duration;
+import java.util.Objects;
 
-public class Kipbar {
+import lombok.Getter;
+
+@Getter
+public class Kipbar implements Closeable {
+    private static final int MAX_LENGTH = 100;
+    private static final String DEFAULT_SUCCESS_MESSAGE = "Done!";
+    private static final KipbarOptions DEFAULT_OPTIONS = KipbarOptions.builder().build();
+
     private final int length;
-    private int progress = 0;
-    private volatile boolean running = false;
-    private final BlockingDeque<ProgressEvent> events;
-    private char progressChar = '#';
-    private boolean requireDone = true;
+    private final char progressChar;
+    private final boolean printDoneMessage;
+    private final boolean showPercentage;
+    private final boolean showElapsedTime;
+    private final PrintStream output;
+    private final String taskName;
+    private final String failureMessage;
+
+    private int progress;
+    private KipbarState state = KipbarState.READY;
+    private boolean closed;
+    private int lastRenderLength;
+    private long startNanos;
+    private long finishedNanos;
 
     public Kipbar(int length) {
-        if (length <= 0 || length > 100) throw new IllegalArgumentException("length must be between 1 and 100");
-        this.length = length;
-        events = new LinkedBlockingDeque<>(length);
+        this(length, DEFAULT_OPTIONS);
     }
 
     public Kipbar(int length, char progressChar) {
-        this(length);
-        this.progressChar = progressChar;
+        this(length, KipbarOptions.builder().progressChar(progressChar).build());
     }
 
-    public Kipbar(int length, boolean requireDone) {
-        this(length);
-        this.requireDone = requireDone;
+    public Kipbar(int length, boolean printDoneMessage) {
+        this(length, KipbarOptions.builder().printDoneMessage(printDoneMessage).build());
     }
 
-    public Kipbar(int length, char progressChar, boolean requireDone) {
-        this(length, progressChar);
-        this.requireDone = requireDone;
+    public Kipbar(int length, char progressChar, boolean printDoneMessage) {
+        this(length, KipbarOptions.builder()
+                .progressChar(progressChar)
+                .printDoneMessage(printDoneMessage)
+                .build());
     }
 
-    public void run() throws InterruptedException {
-        try {
-            new Thread(() -> {
-                try {
-                    progress();
-                } catch (InterruptedException e) {
-                    throw new RuntimeException();
-                }
-            }).start();
-            do {
-                switch (events.poll(1000, TimeUnit.MILLISECONDS)) {
-                    case START -> {
-                        running = true;
-                        System.out.print("[");
-                        for (int i = 0; i < length; i++) System.out.print(" ");
-                        System.out.print("]");
-                        System.out.print("\u001B[" + (length + 1) + "D");
-                    }
-                    case UPDATE -> System.out.print(progressChar);
-                    case DONE -> running = false;
-                    case null -> {}
-                }
-            } while (running);
-            if (requireDone) System.out.println("\nDone!");
-        } catch (RuntimeException e) {
-            running = false;
-            throw e;
+    public Kipbar(int length, KipbarOptions options) {
+        validateLength(length);
+        Objects.requireNonNull(options, "options must not be null");
+        this.length = length;
+        this.progressChar = options.getProgressChar();
+        this.printDoneMessage = options.isPrintDoneMessage();
+        this.showPercentage = options.isShowPercentage();
+        this.showElapsedTime = options.isShowElapsedTime();
+        this.output = Objects.requireNonNull(options.getOutput(), "output must not be null");
+        this.taskName = normalizeTaskName(options.getTaskName());
+        this.failureMessage = normalizeFailureMessage(options.getFailureMessage());
+    }
+
+    public void run(InterruptibleTask task) throws InterruptedException {
+        if (task == null) {
+            throw new IllegalArgumentException("task must not be null");
         }
-    }
-
-    public void progress() throws InterruptedException {
+        ensureOpen();
         start();
-        for (int i = 1; i <= length; i++) {
-            update(1);
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException _) {
+        boolean completed = false;
+        try {
+            task.run(this);
+            completed = true;
+        } finally {
+            if (state == KipbarState.RUNNING) {
+                complete(completed);
             }
         }
-        done();
     }
 
-    public void start() throws InterruptedException {
+    public void start() {
+        ensureStartable();
         progress = 0;
-        events.put(ProgressEvent.START);
+        state = KipbarState.RUNNING;
+        lastRenderLength = 0;
+        startNanos = System.nanoTime();
+        finishedNanos = 0L;
+        render();
     }
 
-    public void done() throws InterruptedException {
-        events.put(ProgressEvent.DONE);
+    public void update(int n) {
+        if (n < 0) {
+            throw new IllegalArgumentException("update value must be non-negative");
+        }
+        ensureActive();
+        progress = Math.min(length, progress + n);
+        render();
     }
 
-    public void update(int n) throws InterruptedException {
-        if (n + progress > length) return;
-        for (int i = 0; i < n; i++) {
-            progress++;
-            events.put(ProgressEvent.UPDATE);
+    public void step() {
+        update(1);
+    }
+
+    public void finish() {
+        complete(true);
+    }
+
+    public void fail() {
+        complete(false);
+    }
+
+    public boolean isStarted() {
+        return state != KipbarState.READY;
+    }
+
+    public boolean isFinished() {
+        return state.isTerminal();
+    }
+
+    public Duration getElapsed() {
+        if (!isStarted()) {
+            return Duration.ZERO;
+        }
+        long endNanos = state.isTerminal() ? finishedNanos : System.nanoTime();
+        return Duration.ofNanos(endNanos - startNanos);
+    }
+
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        if (state == KipbarState.RUNNING) {
+            complete(false);
+        }
+        closed = true;
+    }
+
+    private void complete(boolean success) {
+        ensureOpen();
+        ensureStarted();
+        if (state.isTerminal()) {
+            return;
+        }
+        if (success) {
+            progress = length;
+        }
+        state = success ? KipbarState.SUCCEEDED : KipbarState.FAILED;
+        finishedNanos = System.nanoTime();
+        render();
+        output.println();
+        printCompletionMessage(success);
+    }
+
+    private void render() {
+        String line = buildLine();
+        int padding = Math.max(0, lastRenderLength - line.length());
+        output.print(line);
+        if (padding > 0) {
+            output.print(" ".repeat(padding));
+        }
+        output.flush();
+        lastRenderLength = line.length();
+    }
+
+    private void ensureOpen() {
+        if (closed) {
+            throw new IllegalStateException("progress bar has already been closed");
         }
     }
+
+    private void ensureActive() {
+        ensureOpen();
+        ensureStarted();
+        ensureNotFinished();
+    }
+
+    private void ensureStartable() {
+        ensureOpen();
+        if (state == KipbarState.RUNNING) {
+            throw new IllegalStateException("progress bar has already started");
+        }
+        if (state.isTerminal()) {
+            throw new IllegalStateException("progress bar has already finished");
+        }
+    }
+
+    private void ensureNotFinished() {
+        if (state.isTerminal()) {
+            throw new IllegalStateException("progress bar has already finished");
+        }
+    }
+
+    private void ensureStarted() {
+        if (!isStarted()) {
+            throw new IllegalStateException("progress bar has not started");
+        }
+    }
+
+    private static void validateLength(int length) {
+        if (length <= 0 || length > MAX_LENGTH) {
+            throw new IllegalArgumentException("length must be between 1 and " + MAX_LENGTH);
+        }
+    }
+
+    private String buildLine() {
+        int remaining = length - progress;
+        StringBuilder builder = new StringBuilder();
+        builder.append('\r');
+        if (taskName != null) {
+            builder.append(taskName).append(' ');
+        }
+        builder.append('[');
+        builder.repeat(String.valueOf(progressChar), progress);
+        builder.repeat(" ", remaining);
+        builder.append(']');
+        if (showPercentage) {
+            builder.append(' ').append(String.format("%3d%%", progress * 100 / length));
+        }
+        if (showElapsedTime) {
+            builder.append(' ').append(formatElapsed(getElapsed()));
+        }
+        return builder.toString();
+    }
+
+    private void printCompletionMessage(boolean success) {
+        if (success) {
+            if (printDoneMessage) {
+                output.println(DEFAULT_SUCCESS_MESSAGE);
+            }
+            return;
+        }
+        if (failureMessage != null) {
+            output.println(failureMessage);
+        }
+    }
+
+    private static String normalizeTaskName(String taskName) {
+        return normalizeText(taskName);
+    }
+
+    private static String normalizeFailureMessage(String failureMessage) {
+        return normalizeText(failureMessage);
+    }
+
+    private static String normalizeText(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return value.trim();
+    }
+
+    private static String formatElapsed(Duration elapsed) {
+        long totalSeconds = elapsed.toSeconds();
+        long hours = totalSeconds / 3600;
+        long minutes = (totalSeconds % 3600) / 60;
+        long seconds = totalSeconds % 60;
+        if (hours > 0) {
+            return "%02d:%02d:%02d".formatted(hours, minutes, seconds);
+        }
+        return "%02d:%02d".formatted(minutes, seconds);
+    }
+
+    @FunctionalInterface
+    public interface InterruptibleTask {
+        void run(Kipbar bar) throws InterruptedException;
+    }
+
 }
