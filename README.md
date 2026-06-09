@@ -2,6 +2,10 @@
 
 Kipbar is a small Java progress bar utility for console applications.
 
+Maven Central:
+
+- https://central.sonatype.com/artifact/club.muimi/Kipbar
+
 It provides:
 
 - Configurable progress bar width and fill character
@@ -16,7 +20,17 @@ It provides:
 
 ## Installation
 
-Clone the project and build it locally:
+Add Kipbar from Maven Central:
+
+```xml
+<dependency>
+    <groupId>club.muimi</groupId>
+    <artifactId>Kipbar</artifactId>
+    <version>1.1.1</version>
+</dependency>
+```
+
+Or clone the project and build it locally:
 
 ```bash
 mvn test
